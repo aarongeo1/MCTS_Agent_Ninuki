@@ -49,7 +49,9 @@ class GoBoardUtil(object):
         moves: np.ndarray[GO_POINT] = board.get_empty_points()
         np.random.shuffle(moves)
         for move in moves:
-            legal: bool = board.is_legal(move, color)
+            legal: bool = not (
+                use_eye_filter and board.is_eye(move, color)
+            ) and board.is_legal(move, color)
             if legal:
                 return move
         return PASS

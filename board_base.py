@@ -16,7 +16,7 @@ EMPTY = GO_COLOR(0)
 BLACK = GO_COLOR(1)
 WHITE = GO_COLOR(2)
 BORDER = GO_COLOR(3)
-
+CUR = GO_COLOR(1)
 
 def is_black_white(color: GO_COLOR) -> bool:
     return color == BLACK or color == WHITE
@@ -49,7 +49,7 @@ To support larger boards the coordinate printing in
 GtpConnection.format_point needs to be changed.
 """
 MAXSIZE: int = 25
-DEFAULT_SIZE: int = 5
+DEFAULT_SIZE: int = 7
 
 """
 The number of array elements in a "padded 1D" representation 

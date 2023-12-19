@@ -10,10 +10,13 @@ at the University of Edinburgh.
 """
 import traceback
 import numpy as np
+import threading
 import re
+import time
+
 from sys import stdin, stdout, stderr
 from typing import Any, Callable, Dict, List, Tuple
-
+from cmath import inf
 from board_base import (
     BLACK,
     WHITE,
@@ -23,7 +26,8 @@ from board_base import (
     PASS,
     MAXSIZE,
     coord_to_point,
-    opponent
+    opponent,
+    CUR
 )
 from board import GoBoard
 from board_util import GoBoardUtil
@@ -42,6 +46,18 @@ class GtpConnection:
         board: 
             Represents the current board state.
         """
+        self.transposition_table: Dict[str, Tuple[float, str]] = {}
+        self.time = 1
+        self.time_copy = 1
+        self.thread_active = False
+        self.solve_value = ''
+        self.board_copy = None
+        self.board_copy2 = None
+        self.timer_thread = None
+        self.timer_thread_1 = None
+        self.legal_moves = []
+        self.board_color = None
+
         self._debug_mode: bool = debug_mode
         self.go_engine = go_engine
         self.board: GoBoard = board
@@ -59,8 +75,6 @@ class GtpConnection:
             "list_commands": self.list_commands_cmd,
             "play": self.play_cmd,
             "legal_moves": self.legal_moves_cmd,
-            "policy": self.policy_cmd,
-            "policy_moves": self.policy_moves_cmd,
             "gogui-rules_legal_moves": self.gogui_rules_legal_moves_cmd,
             "gogui-rules_final_result": self.gogui_rules_final_result_cmd,
             "gogui-rules_captured_count": self.gogui_rules_captured_count_cmd,
@@ -72,6 +86,24 @@ class GtpConnection:
             "timelimit": self.timelimit_cmd,
             "solve": self.solve_cmd
         }
+        # Initialize Zobrist hash table
+        # self.zobrist_hash_table = [[
+        #     [np.random.randint(0, 2**32)
+        #      for _ in range(self.board.size * self.board.size)]
+        #     for _ in range(2)
+        # ] for _ in range(self.board.size)]
+        new_size = self.board.size + 1  # Replace this with your desired size
+        self.zobrist_hash_table = [
+            [
+                [np.random.randint(0, 2**63-1, dtype=np.int64)
+                 for _ in range(new_size * new_size)]
+                for _ in range(2)
+            ]
+            for _ in range(new_size)
+        ]
+
+        # Initialize the hash value
+        self.current_hash = 0
 
         # argmap is used for argument checking
         # values: (required number of arguments,
@@ -233,7 +265,6 @@ class GtpConnection:
             coords: Tuple[int, int] = point_to_coord(move, self.board.size)
             gtp_moves.append(format_point(coords))
         sorted_moves = " ".join(sorted(gtp_moves))
-        self.respond(sorted_moves)
 
     """
     ==========================================================================
@@ -328,7 +359,7 @@ class GtpConnection:
         try:
             board_color = args[0].lower()
             board_move = args[1]
-            if board_color not in ['b', 'w']:
+            if board_color not in ['b', 'w', 'e']:
                 self.respond('illegal move: "{} {}" wrong color'.format(
                     board_color, board_move))
                 return
@@ -336,6 +367,7 @@ class GtpConnection:
             move = coord_to_point(coord[0], coord[1], self.board.size)
 
             color = color_to_int(board_color)
+            CUR = opponent(color)
             if not self.board.play_move(move, color):
                 # self.respond("Illegal Move: {}".format(board_move))
                 self.respond('illegal move: "{} {}" occupied'.format(
@@ -354,6 +386,7 @@ class GtpConnection:
         except Exception as e:
             self.respond('illegal move: "{} {}" {}'.format(
                 args[0], args[1], str(e)))
+        return
 
     def gogui_rules_captured_count_cmd(self, args: List[str]) -> None:
         """ We already implemented this function for Assignment 2 """
@@ -365,43 +398,392 @@ class GtpConnection:
     Assignment 2 - game-specific commands you have to implement or modify
     ==========================================================================
     """
+    def timer_countdown(self):
+        if not self.solve_value:
+            self.board = self.board_copy
+            rng = np.random.default_rng()
+            choice = rng.choice(len(self.legal_moves))
+            move = self.legal_moves[choice]
+            move_coord = point_to_coord(move, self.board.size)
+            move_as_string = format_point(move_coord)
+            self.timer_thread.cancel()
+            self.play_cmd([self.board_color, move_as_string, 'print_move'])
+
+        else:
+            # print("not random")
+            self.timer_thread.cancel()
+            self.play_cmd([self.board_color, self.solve_value, 'print_move'])
+        
+        self.thread_active = False
+        self.start_connection()
+        return
+
+
+    def genmove_cmd(self, args: List[str]) -> None:
+        """ 
+        Modify this function for Assignment 2.
+        """
+        self.solve_value = False
+        # Timer implementation
+        self.timer_thread = threading.Timer(self.time, self.timer_countdown)
+        
+        self.board_color = args[0].lower()
+        # color = color_to_int(self.board_color)
+        self.legal_moves = self.board.get_empty_points()
+        self.board_copy = self.board.copy()
+        
+        self.timer_thread.start()
+        self.thread_active = True
+        self.solve_cmd(args)
+        self.thread_active = False
+        # self.board = board
+        return
+
 
     def timelimit_cmd(self, args: List[str]) -> None:
         """ Implement this function for Assignment 2 """
-        self.timelimit = args[0]
-        self.respond('')
+        time = int(args[0])
+        if time < 1 or time > 100:
+            self.respond(
+                "Time limit should be in the range 1 <= seconds <= 100")
+            return
+
+        else:
+            self.time = time
+            self.respond()
+
+    def ninuki_legal_moves_cmd(self, args: List[str]) -> None:
+        """ We already implemented this function for Assignment 2 """
+        if (self.board.detect_five_in_a_row() != EMPTY) or \
+            (self.board.get_captures(BLACK) >= 10) or \
+                (self.board.get_captures(WHITE) >= 10):
+            self.respond("")
+            return
+        legal_moves = self.board.get_empty_points()
+        gtp_moves: List[str] = []
+        for move in legal_moves:
+            coords: Tuple[int, int] = point_to_coord(move, self.board.size)
+            gtp_moves.append(format_point(coords))
+        sorted_moves = sorted(gtp_moves)
+        return (sorted_moves)
+
+    # def order_mm_moves(self, turn):
+    #     sorted_moves = []
+    #     self.ninuki_legal_moves_cmd([turn])
+    #     bc = self.board.get_captures(BLACK)
+    #     wc = self.board.get_captures(WHITE)
+    #     saved_board = self.board.copy()
+    #     for m in self.ninuki_legal_moves_cmd([turn]):
+    #         self.play_move([turn, m])
+    #         if self.endOfGame():
+    #             sorted_moves.insert(0, m)
+    #         else:
+    #             sorted_moves.append(m)
+    #         self.undo_move(saved_board, bc, wc)
+    #     return sorted_moves
+
+    def order_mm_moves(self, turn):
+        sorted_moves = []
+        self.ninuki_legal_moves_cmd([turn])
+        bc = self.board.get_captures(BLACK)
+        wc = self.board.get_captures(WHITE)
+        saved_board = self.board.board.copy()
+        for m in self.ninuki_legal_moves_cmd([turn]):
+            self.play_move([turn, m])
+            if self.endOfGame():
+                sorted_moves.insert(0, m)
+            else:
+                sorted_moves.append(m)
+            self.play_move(["e", m])
+        return sorted_moves
+
+    def solved_timer(self):
+        if not self.solve_value:
+            self.respond("unknown")
+            self.board = self.board_copy2
+        self.timer_thread_1.cancel()
+        self.start_connection()
+        return
 
     def solve_cmd(self, args: List[str]) -> None:
         """ Implement this function for Assignment 2 """
-        pass
+        self.start_time = time.time()
 
-    def policy_cmd(self, args: List[str]):
-        policy_type = args[0]
-        self.go_engine.set_policy_type(policy_type)
-        self.respond()
+        # self.transposition_table.clear()  # Clear the transposition table for a new search
+        self.board_copy2 = self.board.copy()
+        
+        self.timer_thread_1 = None
+        if not self.thread_active:
+            self.timer_thread_1 = threading.Timer(self.time, self.solved_timer)
+            self.timer_thread_1.start()
+        self.solve_value = False
 
-    def policy_moves_cmd(self, args: List[str]):
-        move,type = self.go_engine.generate_move_policy(self.board)
-        moves = []
+        best = -inf
+        if self.board.current_player == BLACK:
+            turn = "b"
+        else:
+            turn = "w"
+        alpha = -inf
+        beta = inf
 
-        for m in move:
-            move_coord = point_to_coord(m, self.board.size)
-            move_as_string = format_point(move_coord)
-            moves.append(move_as_string.lower())
-        moves = sorted(moves)
+        # saved_board = self.board.copy()
+        board_hash = self.board2d_hash()
 
-        self.respond(f"{type + ' '}{' '.join(moves)}")
+        for m in self.order_mm_moves(turn):
+            self.play_move([turn,m])
+            if self.endOfGame():
+                self.play_move(["e", m])
+                if not args:    # if call not from genmove
+                    self.respond(turn)
+                self.solve_value = m.lower()
+                return 
 
-    def genmove_cmd(self, args: List[str]):
-        move = self.go_engine.generate_move(self.board)
-        move_coord = point_to_coord(move[0], self.board.size)
-        move_as_string = format_point(move_coord)
-        self.board.play_move(move[0], self.board.current_player)
-        self.respond(move_as_string.lower())
+            if self.board.current_player == BLACK:
+                turn = "b"
+            else:
+                turn = "w"
+            value = self.minimaxAND(alpha, beta)
+            if value > best:
+                best = value
+                best_move = m
+
+            alpha = max(alpha,best)
+            self.play_move(["e", m])
+
+            if beta <= alpha:
+                break
+            if time.time() - self.start_time > self.time - 0.2:
+                return best
+        self.board = self.board_copy2
+        if best > 0:
+            if self.board.current_player == BLACK:
+                WIN = "b"
+            else:
+                WIN = "w"
+
+            if not args:      # not called from genmove
+                self.respond(WIN + " " + best_move.lower())
+            self.solve_value = best_move.lower()
+            
+
+        elif best < 0:
+            if self.board.current_player == BLACK:
+                WIN = "w"
+            else:
+                WIN = "b"
+
+            if not args:
+                self.respond(WIN)
+            self.solve_value = best_move.lower()
+
+        else:
+            if not args: 
+                self.respond("draw " + best_move.lower())
+            self.solve_value = best_move.lower()
+            
+        self.transposition_table[board_hash] = (best, best_move)
+        return
+
+    def board2d_hash(self) -> str:
+        # board_str = self.board2d()
+        # print(board_str)
+        # return hashlib.md5(board_str.encode()).hexdigest()
+        return str(self.current_hash)
+
+    def update_hash(self, move: GO_POINT, color: GO_COLOR):
+        row, col = point_to_coord(move, self.board.size)
+        index = row * self.board.size + col
+        if color == BLACK:
+            self.current_hash ^= self.zobrist_hash_table[row][0][index]
+        elif color == WHITE:
+            self.current_hash ^= self.zobrist_hash_table[row][1][index]
+
+
+    def endOfGame(self):
+
+        if self.board.detect_five_in_a_row() != EMPTY:
+
+            return True
+        if self.board.get_captures(BLACK) >= 10 or self.board.get_captures(WHITE) >= 10:
+
+            return True
+        if self.board.get_empty_points().size == 0:
+
+            return True
+        return False
+
+    def staticallyEvaluate(self):
+        opp = opponent(self.board.current_player)
+        CUR = self.board.current_player
+        result1 = self.board.detect_five_in_a_row()
+        result2 = EMPTY
+        if self.board.get_captures(CUR) >= 10:
+            result2 = CUR
+        elif self.board.get_captures(opp) >= 10:
+            result2 = opp
+        points = 0
+        if (result1 == CUR):
+            return self.board.get_empty_points().size*1
+        elif (result2 == CUR):
+            return self.board.get_captures(CUR)*100
+        elif (result1 == opp):
+            return self.board.get_empty_points().size*-1
+        elif (result2 == opp):
+            return self.board.get_captures(opp)*-100
+        else:
+            # If the game is still ongoing and not a clear win or draw, return a value
+            return 0  # You can adjust this value as needed
+
+    def play_move(self, args: List[str]) -> None:
+        """ We already implemented this function for Assignment 2 """
+        try:
+            board_color = args[0].lower()
+            board_move = args[1]
+            if board_color not in ['b', 'w', "e"]:
+                self.respond('illegal move: "{} {}" wrong color'.format(
+                    board_color, board_move))
+                return
+
+            coord = move_to_coord(args[1], self.board.size)
+            move = coord_to_point(coord[0], coord[1], self.board.size)
+
+            color = color_to_int(board_color)
+            self.update_hash(move, color)
+
+            if not self.board.play_move(move, color):
+                # self.respond("Illegal Move: {}".format(board_move))
+                self.respond('illegal move: "{} {}" occupied'.format(
+                    board_color, board_move))
+                return
+            else:
+
+                self.debug_msg(
+                    "Move: {}\nBoard:\n{}\n".format(board_move, self.board2d())
+                )
+            
+            if len(args) > 2 and args[2] == 'print_move':
+                move_as_string = format_point(coord)
+                self.respond(move_as_string.lower())
+    
+        except Exception as e:
+            self.respond('illegal move: "{} {}" {}'.format(
+
+                args[0], args[1], str(e)))
+
+    def undo_move(self, saved_board, black_captures, white_captures):
+        """
+        Undo the move by restoring the board and capture counts to their previous state.
+        """
+        self.board = saved_board.copy()
+        self.board.black_captures = black_captures
+        self.board.white_captures = white_captures
+
+
+    # def undo_move(self, saved_board, black_captures, white_captures):
+    #     """
+    #     Undo the move by restoring the board and capture counts to their previous state.
+    #     """
+    #     self.board = saved_board.copy()
+    #     self.board.black_captures = black_captures
+    #     self.board.white_captures = white_captures
+            
+
+    def minimaxOR(self, alpha=-inf, beta=inf):
+        board_hash = self.board2d_hash()
+        best_move = None
+        # print(board_hash)
+        if board_hash in self.transposition_table:
+            # print("transposition found OR")
+            cached_score, best_move = self.transposition_table[board_hash]
+            # print(cached_score)
+            # print("OR cache score" + str(cached_score)+"inserted")
+
+            return cached_score
+        if self.endOfGame():
+            return self.staticallyEvaluate()
+
+        best = -inf
+        if self.board.current_player == BLACK:
+            turn = "b"
+        else:
+            turn = "w"
+        # print(turn)
+        # print(self.ninuki_legal_moves_cmd([turn]))
+        for m in self.ninuki_legal_moves_cmd([turn]):
+            self.play_move([turn, m])
+            value = self.minimaxAND(alpha, beta)
+            # best = max(best, value)
+
+            if value > best:
+                best = value
+                best_move = m
+            # Update alpha
+            alpha = max(alpha, best)
+            self.play_move(["e", m])
+
+            # Prune if beta <= alpha
+            if beta <= alpha:
+                break
+            if time.time() - self.start_time > self.time - 0.2:
+                return best
+
+        # Note: No best move for OR nodes
+        self.transposition_table[board_hash] = (best, best_move)
+        # print(self.transposition_table[board_hash])
+        return best
+
+    def minimaxAND(self, alpha=-inf, beta=inf):
+
+
+        board_hash = self.board2d_hash()
+        best_move = None
+        # print(board_hash)
+        if board_hash in self.transposition_table:
+            cached_score, best_move = self.transposition_table[board_hash]
+            # print("AND cache score" + str(cached_score)+"inserted")
+            return cached_score
+
+
+        if self.endOfGame():
+            return self.staticallyEvaluate()
+
+        best = inf
+
+        if self.board.current_player == BLACK:
+            turn = "b"
+        else:
+            turn = "w"
+        # print(turn)
+        # print(self.ninuki_legal_moves_cmd([turn]))
+        for m in self.ninuki_legal_moves_cmd([turn]):
+
+            self.play_move([turn, m])
+
+            value = self.minimaxOR(alpha, beta)
+
+            # best = min(best, value)
+            if value < best:
+                best = value
+                best_move = m
+
+            # Update beta
+            beta = min(beta, best)
+            self.play_move(["e", m])
+            # print(self.ninuki_legal_moves_cmd([turn]))
+
+            # Prune if beta <= alpha
+            if beta <= alpha:
+                break
+            if time.time() - self.start_time > self.time - 0.2:
+                return best
+
+        self.transposition_table[board_hash] = (best, best_move)
+        # print(self.transposition_table[board_hash])
+        return best
 
     """
     ==========================================================================
-    Assignment 1 - game-specific commands end here
+    Assignment 2 - game-specific commands end here
     ==========================================================================
     """
 
