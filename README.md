@@ -3,4 +3,4 @@ The game + agent for a version of Gomoku, where five in a row and 10 captures to
 
 Made for the class CMPUT 455 Fall 2023
 # 
-Code made by TA and Professor has been cited in that particular file
+Sample Code made by TA and Professor has been cited in that particular file
